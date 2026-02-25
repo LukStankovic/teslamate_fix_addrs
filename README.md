@@ -20,7 +20,7 @@ Fix empty addresses in teslamate.
 
 - You have access to openstreetmap.org **via your HTTP proxy**
 
-  
+
 ## Guides
 ### How it works
 
@@ -36,9 +36,11 @@ teslamate_fix_addrs will search all drives or charging processes, get records wh
 
 **Update address details**
 
-Update address by [amap api](https://lbs.amap.com/api/webservice/summary). Some of address is not correct resoved by open street map, use amap to get addresses is much better (and faster) in China, update address if amap has more details.
+Update address by [Tencent Maps API](https://lbs.qq.com/service/webService/webServiceGuide/webServiceGcoder) (reverse geocoding). Some of address is not correctly resolved by open street map, use Tencent Maps to get addresses is much better (and faster) in China, update address if Tencent Maps has more details.
 
-when the program run in first round, all addresses with comma (which means this address is added by open street map) in display_name column will be updated. In subsequent rounds, it will only check new added records by compare updated_at column.
+Tencent Maps supports `coord_type=1` to directly accept WGS84 (GPS) coordinates, so no coordinate transformation step is needed.
+
+When the program runs in the first round, all addresses will be updated. In subsequent rounds, it will only check new added records by comparing the `updated_at` column.
 
 
 
@@ -47,10 +49,10 @@ when the program run in first round, all addresses with comma (which means this 
 `-m` `--mode` or environment `MODE` is used to configure teslamate_fix_addrs' running mode.
 
 * 0: fix empty address only.
-* 1: use amap to update address only.
+* 1: use Tencent Maps to update address only.
 * 2: do both.
 
-If you what to update addresses by amap, remember to [apply a key](https://lbs.amap.com/api/webservice/guide/create-project/get-key) first, and pass the key value by `-k` `--key` or environment `KEY`
+If you want to update addresses by Tencent Maps, you need to [apply for a key](https://lbs.qq.com/dev/console/application/mine) first, and pass the key value by `-k` `--key` or environment `TENCENT_KEY`. You also need to configure the SK (Secret Key) via `--sk` or environment `TENCENT_SK` for API signature verification.
 
 
 
@@ -62,7 +64,7 @@ If you what to update addresses by amap, remember to [apply a key](https://lbs.a
 
 ### Low memory support
 
-User `-b` `--batch` or environment `BATCH` to limit the number of records for one loop which can save memory use. 
+User `-b` `--batch` or environment `BATCH` to limit the number of records for one loop which can save memory use.
 
 All added or modified records will be commited at the end of each loop.
 
@@ -85,7 +87,7 @@ If open street map is baned in your region, you need a proxy to get access to it
 
 If you use the socks protocol proxy, set environment variable:
 * HTTP_PROXY=socks5://proxy.ip:port
-* HTTPS_PROXY=socks5://proxy.ip:port 
+* HTTPS_PROXY=socks5://proxy.ip:port
 
 
 
@@ -108,7 +110,7 @@ If you installed teslamate by docker, you can choose alternative solutions.
          - 5432:5432
    ```
 
-   
+
 
 2. Add teslamate_fix_addrs in your docker-compose.yaml, so they are in the same network.
 
@@ -121,7 +123,7 @@ If you installed teslamate by docker, you can choose alternative solutions.
          - POSTGRES_USER=teslamate
          - POSTGRES_PASSWORD=123456
          - POSTGRES_DB=teslamate
-   
+
      teslamate_fix_addrs:
        image: hipudding/teslamate_fix_addrs:latest
        container_name: teslmate_fix_addrs
@@ -138,11 +140,12 @@ If you installed teslamate by docker, you can choose alternative solutions.
        - INTERVAL=10
        - MODE=0
        - SINCE=2024-01-24
-       - KEY=
+       - TENCENT_KEY=your_tencent_key
+       - TENCENT_SK=your_tencent_sk
        - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
    ```
 
-   
+
 
 
 
@@ -167,7 +170,8 @@ teslamate_fix_addrs:
     - INTERVAL=5
     - MODE=0
     - SINCE=2024-01-24
-    - KEY=
+    - TENCENT_KEY=your_tencent_key
+    - TENCENT_SK=your_tencent_sk
     - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
 ```
 
@@ -176,7 +180,7 @@ teslamate_fix_addrs:
 **Run python script**
 
 ```
-usage: teslamate_fix_addrs.py [-h] -u USER -p PASSWORD -H HOST -P PORT -d DBNAME [-b BATCH] [-t TIMEOUT] [-r RETRY] [-i INTERVAL] [-ua USER_AGENT]
+usage: teslamate_fix_addrs.py [-h] -u USER -p PASSWORD -H HOST -P PORT -d DBNAME [-b BATCH] [-t TIMEOUT] [-r RETRY] [-i INTERVAL] [-m MODE] [-k KEY] [--sk SK] [-s SINCE] [-ua USER_AGENT]
 
 Usage of address fixer.
 
@@ -191,8 +195,9 @@ options:
   -t TIMEOUT, --timeout TIMEOUT            http request timeout(s)(HTTP_TIMEOUT).
   -r RETRY, --retry RETRY                  http request max retries(HTTP_RETRY).
   -i INTERVAL, --interval INTERVAL         if value not 0, run in infinity mode, fix record in every interval seconds(INTERVAL).
-  -m MODE, --mode MODE                     run mode: 0 -> fix empty record; 1 -> update address by amap; 2 -> do both(MODE).
-  -k KEY, --key KEY                        API key for calling amap(KEY).
+  -m MODE, --mode MODE                     run mode: 0 -> fix empty record; 1 -> update address by tencent; 2 -> do both(MODE).
+  -k KEY, --key KEY                        API key for calling tencent maps(TENCENT_KEY).
+  --sk SK                                  SK for tencent maps signature(TENCENT_SK).
   -s SINCE, --since SINCE                  Update from specified date(YYYY-mm-dd).
   -ua USER_AGENT, --user_agent USER_AGENT  Custom User-Agent for HTTP requests(USER_AGENT).
 ```
@@ -201,7 +206,7 @@ options:
 
 ### Run in sandbox
 
-Worry about damaging existing data？ You can have a try in sandbox.
+Worry about damaging existing data? You can have a try in sandbox.
 
 1. Prepare a different machine than the one where your teslamate is located, or different docker containers.
 
@@ -211,7 +216,7 @@ Worry about damaging existing data？ You can have a try in sandbox.
 
    ```
    version: "3"
-   
+
    services:
      database:
        image: postgres:15
@@ -220,7 +225,7 @@ Worry about damaging existing data？ You can have a try in sandbox.
          - POSTGRES_USER=teslamate
          - POSTGRES_PASSWORD=123456
          - POSTGRES_DB=teslamate
-   
+
      grafana:
        image: teslamate/grafana:latest
        restart: always
@@ -233,7 +238,7 @@ Worry about damaging existing data？ You can have a try in sandbox.
          - 3000:3000
        volumes:
          - teslamate-grafana-data:/var/lib/grafana
-   
+
      teslamate_fix_addrs:
        image: hipudding/teslamate_fix_addrs:latest
        container_name: teslmate_fix_addrs
@@ -250,9 +255,10 @@ Worry about damaging existing data？ You can have a try in sandbox.
        - INTERVAL=10
        - MODE=0
        - SINCE=2024-01-24
-       - KEY=
+       - TENCENT_KEY=your_tencent_key
+       - TENCENT_SK=your_tencent_sk
        - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
-   
+
    volumes:
      teslamate-grafana-data:
    ```

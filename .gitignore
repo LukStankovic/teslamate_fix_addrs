@@ -1,1 +1,4 @@
 .vscode
+*.db
+checkpoint.json
+test_checkpoint.json
