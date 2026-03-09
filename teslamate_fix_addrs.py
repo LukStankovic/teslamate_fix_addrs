@@ -118,8 +118,7 @@ def _default_checkpoint():
         },
         "map_update": {
             "last_address_id": 0,
-            "updated_count": 0,
-            "failed_ids": []
+            "updated_count": 0
         },
         "last_run": None
     }
@@ -134,9 +133,6 @@ def load_checkpoint(path):
             # Migrate old checkpoint key.
             if 'tencent_update' in data and 'map_update' not in data:
                 data['map_update'] = data.pop('tencent_update')
-            # Migrate: ensure failed_ids exists.
-            data.setdefault('map_update', {})
-            data['map_update'].setdefault('failed_ids', [])
             logging.info("Loaded checkpoint from %s" % path)
             return data
         except (json.JSONDecodeError, IOError) as e:
@@ -608,77 +604,48 @@ def get_update_record_count(session, Addresses, config, last_address_id):
         .count()
 
 
-def get_need_update_addresses(session, Addresses, config, last_address_id, limit=None):
+def get_need_update_addresses(session, Addresses, config, last_address_id):
     """Get batch of addresses to update."""
     return session \
         .query(Addresses) \
         .filter(Addresses.updated_at >= config.since) \
         .filter(Addresses.id > last_address_id) \
         .order_by(Addresses.id) \
-        .limit(limit if limit is not None else config.batch) \
+        .limit(config.batch) \
         .all()
 
 
 def update_address_batch(session, geocoder, config, Addresses, checkpoint):
     """Update one batch of addresses via reverse geocoder.
-    Returns (updated_count, found_count, new_count)."""
+    Returns (updated_count, found_count)."""
     processed_count = 0
     last_address_id = checkpoint['map_update']['last_address_id']
-    failed_ids = set(checkpoint['map_update'].get('failed_ids', []))
 
-    # Priority 1: retry previously failed records (up to batch_size).
-    retry_records = []
-    if failed_ids:
-        retry_records = (session.query(Addresses)
-                         .filter(Addresses.id.in_(failed_ids))
-                         .order_by(Addresses.id)
-                         .limit(config.batch)
-                         .all())
+    need_update_count = get_update_record_count(
+        session, Addresses, config, last_address_id)
+    need_update_addresses = get_need_update_addresses(
+        session, Addresses, config, last_address_id)
 
-    # Priority 2: fill remaining capacity with new records.
-    new_limit = config.batch - len(retry_records)
-    new_records = []
-    if new_limit > 0:
-        new_records = get_need_update_addresses(
-            session, Addresses, config, last_address_id, limit=new_limit)
-
-    retry_ids_in_batch = {r.id for r in retry_records}
-    need_update_count = (get_update_record_count(
-        session, Addresses, config, last_address_id) + len(failed_ids))
-
-    for address_record in retry_records + new_records:
-        is_retry = address_record.id in retry_ids_in_batch
-        logging.info("processing update address (%d left)%s" % (
-            need_update_count - processed_count,
-            " [retry]" if is_retry else ""))
+    for address_record in need_update_addresses:
+        logging.info("processing update address (%d left)" %
+                     (need_update_count - processed_count))
 
         result = geocoder.reverse_geocode(
             address_record.latitude,
             address_record.longitude
         )
-
-        # For new records: always advance cursor regardless of outcome.
-        if not is_retry:
-            checkpoint['map_update']['last_address_id'] = address_record.id
-
+        # Always advance checkpoint, even on failure, to prevent permanently
+        # skipping records when a later record in the same batch succeeds.
+        checkpoint['map_update']['last_address_id'] = address_record.id
         if result is None:
-            if not is_retry:
-                failed_ids.add(address_record.id)
-                logging.warning(
-                    "Geocoding failed for address id=%d, queued for retry." %
-                    address_record.id)
-            else:
-                logging.warning(
-                    "Geocoding retry failed for address id=%d." %
-                    address_record.id)
+            logging.warning("Geocoding failed for address id=%d, skipping." %
+                            address_record.id)
             continue
 
-        failed_ids.discard(address_record.id)
         geocoder.update_address(address_record, result)
         processed_count += 1
 
-    checkpoint['map_update']['failed_ids'] = sorted(failed_ids)
-    return processed_count, len(retry_records) + len(new_records), len(new_records)
+    return processed_count, len(need_update_addresses)
 
 
 def update_addresses(engine, geocoder, config, Addresses, checkpoint):
@@ -686,23 +653,16 @@ def update_addresses(engine, geocoder, config, Addresses, checkpoint):
     while True:
         with Session(engine) as session:
             logging.info("updating addresses...")
-            count, found, new_count = update_address_batch(
+            count, found = update_address_batch(
                 session, geocoder, config, Addresses, checkpoint)
             if found == 0:
-                # No new records and no pending retries.
-                break
-            if new_count == 0 and count == 0:
-                # Frontier exhausted; remaining retries all failed this pass.
-                logging.warning(
-                    "No new records and all retries failed, stopping. "
-                    "%d record(s) in failed_ids will be retried on next run." %
-                    len(checkpoint['map_update']['failed_ids']))
-                save_checkpoint(config.checkpoint_path, checkpoint)
                 break
             if count > 0:
                 logging.info("saving...")
                 session.commit()
                 checkpoint['map_update']['updated_count'] += count
+            # Always save checkpoint so skipped (failed) records are not retried
+            # indefinitely within the same run.
             save_checkpoint(config.checkpoint_path, checkpoint)
 
 
