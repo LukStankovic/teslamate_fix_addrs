@@ -102,6 +102,8 @@ class Config:
     user_agent: str = 'teslamate/#v1.29.2'
     checkpoint_path: str = 'checkpoint.json'
     reset_checkpoint: bool = False
+    osm_interval: float = 1.0
+    geocoder_interval: float = 0.3
 
 
 # ---------- Checkpoint persistence ----------
@@ -271,7 +273,7 @@ class TencentGeocoder(ReverseGeocoder):
             return None
 
         # Tencent Maps rate limit
-        time.sleep(0.3)
+        time.sleep(self.config.geocoder_interval)
 
         result = json.loads(raw)
         if result is None or result.get('status') != 0:
@@ -462,6 +464,8 @@ def resolve_osm_address(session, http_client, position, Addresses):
     '''
     url = OSM_RESOLVE_URL % (position.latitude, position.longitude)
     raw = http_client.get(url)
+    # OSM Nominatim rate limit (policy: max 1 req/s)
+    time.sleep(http_client.config.osm_interval)
     if raw is None:
         return None, None
 
@@ -728,6 +732,14 @@ def parse_args():
         action=EnvDefault, envvar="USER_AGENT",
         help="Custom User-Agent for HTTP requests(USER_AGENT).")
     parser.add_argument(
+        "--osm-interval", required=False, type=float, default=1.0,
+        action=EnvDefault, envvar="OSM_INTERVAL",
+        help="seconds to sleep between OSM requests(OSM_INTERVAL).")
+    parser.add_argument(
+        "--geocoder-interval", required=False, type=float, default=0.3,
+        action=EnvDefault, envvar="GEOCODER_INTERVAL",
+        help="seconds to sleep between geocoder API requests(GEOCODER_INTERVAL).")
+    parser.add_argument(
         "-c", "--checkpoint", required=False, type=str,
         default='checkpoint.json',
         action=EnvDefault, envvar="CHECKPOINT_FILE",
@@ -761,6 +773,8 @@ def parse_args():
         user_agent=args.user_agent,
         checkpoint_path=args.checkpoint,
         reset_checkpoint=args.reset_checkpoint,
+        osm_interval=float(args.osm_interval),
+        geocoder_interval=float(args.geocoder_interval),
     )
 
 
