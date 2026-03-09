@@ -269,11 +269,10 @@ class TencentGeocoder(ReverseGeocoder):
         url = "%s?%s" % (self.GEOCODER_URL, query_string)
 
         raw = self.http_client.get(url)
+        # Rate limit: sleep regardless of outcome to avoid hammering the API.
+        time.sleep(self.config.geocoder_interval)
         if raw is None:
             return None
-
-        # Tencent Maps rate limit
-        time.sleep(self.config.geocoder_interval)
 
         result = json.loads(raw)
         if result is None or result.get('status') != 0:
@@ -411,8 +410,7 @@ def get_position(session, position_id, Positions):
     position = session.query(Positions).filter(
         Positions.id == position_id).first()
     if position is None:
-        logging.fatal("Position with ID %s is not found." % position_id)
-        assert False
+        raise RuntimeError("Position with ID %s is not found." % position_id)
     return position
 
 
@@ -618,7 +616,8 @@ def get_need_update_addresses(session, Addresses, config, last_address_id):
 
 
 def update_address_batch(session, geocoder, config, Addresses, checkpoint):
-    """Update one batch of addresses via reverse geocoder. Returns count."""
+    """Update one batch of addresses via reverse geocoder.
+    Returns (updated_count, found_count)."""
     processed_count = 0
     last_address_id = checkpoint['map_update']['last_address_id']
 
@@ -635,14 +634,18 @@ def update_address_batch(session, geocoder, config, Addresses, checkpoint):
             address_record.latitude,
             address_record.longitude
         )
+        # Always advance checkpoint, even on failure, to prevent permanently
+        # skipping records when a later record in the same batch succeeds.
+        checkpoint['map_update']['last_address_id'] = address_record.id
         if result is None:
+            logging.warning("Geocoding failed for address id=%d, skipping." %
+                            address_record.id)
             continue
 
         geocoder.update_address(address_record, result)
-        checkpoint['map_update']['last_address_id'] = address_record.id
         processed_count += 1
 
-    return processed_count
+    return processed_count, len(need_update_addresses)
 
 
 def update_addresses(engine, geocoder, config, Addresses, checkpoint):
@@ -650,15 +653,17 @@ def update_addresses(engine, geocoder, config, Addresses, checkpoint):
     while True:
         with Session(engine) as session:
             logging.info("updating addresses...")
-            count = update_address_batch(
+            count, found = update_address_batch(
                 session, geocoder, config, Addresses, checkpoint)
-            if count == 0:
+            if found == 0:
                 break
-            else:
+            if count > 0:
                 logging.info("saving...")
                 session.commit()
                 checkpoint['map_update']['updated_count'] += count
-                save_checkpoint(config.checkpoint_path, checkpoint)
+            # Always save checkpoint so skipped (failed) records are not retried
+            # indefinitely within the same run.
+            save_checkpoint(config.checkpoint_path, checkpoint)
 
 
 # ---------- Argument parsing ----------
