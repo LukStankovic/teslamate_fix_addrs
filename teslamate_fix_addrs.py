@@ -1,28 +1,30 @@
+from dataclasses import dataclass, field
 from sqlalchemy.ext.automap import automap_base
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine, or_, func
+from sqlalchemy import create_engine, or_
 from sqlalchemy.engine.url import URL
 import requests
 from requests.adapters import HTTPAdapter
 import json
+import hashlib
+import urllib.parse
 from datetime import datetime
 import logging
 import argparse
 import os
 import signal
-from threading import Timer
+import tempfile
 import time
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'  # 设置时间格式
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 
 
-
 def handler(signum, frame):
-    '''Contrl-C handler.'''
+    '''Ctrl-C handler.'''
     logging.info("Ctrl-C pressed, exit.")
     os._exit(0)
 
@@ -46,152 +48,8 @@ class EnvDefault(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
-parser = argparse.ArgumentParser(description='Usage of address fixer.')
-parser.add_argument("-u",
-                    "--user",
-                    required=True,
-                    type=str,
-                    action=EnvDefault,
-                    envvar="DB_USER",
-                    help="db user name(DB_USER).")
-parser.add_argument("-p",
-                    "--password",
-                    required=True,
-                    type=str,
-                    action=EnvDefault,
-                    envvar="DB_PASSWD",
-                    help="db password(DB_PASSWD).")
-parser.add_argument("-H",
-                    "--host",
-                    required=True,
-                    type=str,
-                    action=EnvDefault,
-                    envvar="DB_HOST",
-                    help="db host name or ip address(DB_HOST).")
-parser.add_argument("-P",
-                    "--port",
-                    required=True,
-                    type=str,
-                    action=EnvDefault,
-                    envvar="DB_PORT",
-                    help="db port(DB_PORT).")
-parser.add_argument("-d",
-                    "--dbname",
-                    required=True,
-                    type=str,
-                    action=EnvDefault,
-                    envvar="DB_NAME",
-                    help="db name(DB_NAME).")
-parser.add_argument("-b",
-                    "--batch",
-                    required=False,
-                    type=int,
-                    default=10,
-                    action=EnvDefault,
-                    envvar="BATCH",
-                    help="batch size for one loop(BATCH).")
-parser.add_argument("-t",
-                    "--timeout",
-                    required=False,
-                    type=int,
-                    default=5,
-                    action=EnvDefault,
-                    envvar="HTTP_TIMEOUT",
-                    help="http request timeout(s)(HTTP_TIMEOUT).")
-parser.add_argument("-r",
-                    "--retry",
-                    required=False,
-                    type=int,
-                    default=5,
-                    action=EnvDefault,
-                    envvar="HTTP_RETRY",
-                    help="http request max retries(HTTP_RETRY).")
-parser.add_argument(
-    "-i",
-    "--interval",
-    required=False,
-    type=int,
-    default=0,
-    action=EnvDefault,
-    envvar="INTERVAL",
-    help=
-    "if value not 0, run in infinity mode, fix record in every interval seconds(INTERVAL)."
-)
-parser.add_argument(
-    "-m",
-    "--mode",
-    required=False,
-    type=int,
-    default=0,
-    action=EnvDefault,
-    envvar="MODE",
-    help=
-    "run mode: 0 -> fix empty record; 1 -> update address by amap; 2 -> do both(MODE)."
-)
-parser.add_argument("-k",
-                    "--key",
-                    required=False,
-                    type=str,
-                    default='',
-                    action=EnvDefault,
-                    envvar="KEY",
-                    help="API key for calling amap(KEY).")
+# ---------- OSM address-key aliases (from TeslaMate source) ----------
 
-parser.add_argument("-s",
-                    "--since",
-                    required=False,
-                    type=lambda d: datetime.strptime(d, '%Y-%m-%d'),
-                    default=datetime.min,
-                    action=EnvDefault,
-                    envvar="SINCE",
-                    help="Update from specified date(YYYY-mm-dd).")
-parser.add_argument(
-    "-ua",
-    "--user_agent",
-    required=False,
-    type=str,
-    default='teslamate/#v1.29.2',
-    action=EnvDefault,
-    envvar="USER_AGENT",
-    help="Custom User-Agent for HTTP requests(USER_AGENT)."
-)
-args = parser.parse_args()
-
-
-def custom_json_dumps(d):
-    '''do not add backslash in json.'''
-    return d
-
-conn_url = URL.create(
-    drivername="postgresql",
-    username=args.user,
-    password=args.password,
-    host=args.host,
-    port=args.port,
-    database=args.dbname
-)
-
-engine = create_engine(conn_url, json_serializer=custom_json_dumps, echo=False)
-
-# open street map api.
-osm_resolve_url = "https://nominatim.openstreetmap.org/reverse?lat=%.6f&lon=%.6f&format=jsonv2&addressdetails=1&extratags=1&namedetails=1&zoom=18"
-
-# amap api.
-amap_coordinate_transformation_url = "https://restapi.amap.com/v3/assistant/coordinate/convert?key=%s&coordsys=gps&output=json&locations=%s,%s"
-amap_resolve_url = "https://restapi.amap.com/v3/geocode/regeo?key=%s&output=json&location=%s,%s&poitype=all&extensions=all"
-
-# last updated record id.
-last_update_id = 0
-
-# reflact Objects from db tables.
-Base = automap_base()
-Base.prepare(autoload_with=engine)
-Drives = Base.classes.drives
-ChargingProcesses = Base.classes.charging_processes
-Positions = Base.classes.positions
-Addresses = Base.classes.addresses
-
-# reference to teslamate's source code, get address value from multiple keys.
 house_number_aliases = ['house_number', 'street_number']
 
 road_aliases = [
@@ -212,7 +70,6 @@ municipality_aliases = [
 village_aliases = ["village", "municipality", "hamlet", "locality", "croft"]
 
 city_aliases = ["city", "town", "township"]
-
 city_aliases.extend(village_aliases)
 city_aliases.extend(municipality_aliases)
 
@@ -221,6 +78,271 @@ county_aliases = ["county", "county_code", "department"]
 state_aliases = ['state', 'province', 'state_code']
 
 country_aliases = ['country', 'country_name']
+
+
+# ---------- Config ----------
+
+@dataclass
+class Config:
+    """Encapsulates all runtime configuration."""
+    user: str = ''
+    password: str = ''
+    host: str = ''
+    port: str = ''
+    dbname: str = ''
+    db_url: str = ''
+    batch: int = 10
+    timeout: int = 5
+    retry: int = 5
+    interval: int = 0
+    mode: int = 0
+    tencent_key: str = ''
+    tencent_sk: str = ''
+    since: datetime = field(default_factory=lambda: datetime.min)
+    user_agent: str = 'teslamate/#v1.29.2'
+    checkpoint_path: str = 'checkpoint.json'
+    reset_checkpoint: bool = False
+    osm_interval: float = 1.0
+    geocoder_interval: float = 0.3
+
+
+# ---------- Checkpoint persistence ----------
+
+def _default_checkpoint():
+    """Return a fresh default checkpoint dict."""
+    return {
+        "osm_fix": {
+            "last_drive_id": 0,
+            "last_charging_id": 0,
+            "fixed_count": 0
+        },
+        "map_update": {
+            "last_address_id": 0,
+            "updated_count": 0
+        },
+        "last_run": None
+    }
+
+
+def load_checkpoint(path):
+    """Load checkpoint from JSON file. Returns defaults if file doesn't exist."""
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            # Migrate old checkpoint key.
+            if 'tencent_update' in data and 'map_update' not in data:
+                data['map_update'] = data.pop('tencent_update')
+            logging.info("Loaded checkpoint from %s" % path)
+            return data
+        except (json.JSONDecodeError, IOError) as e:
+            logging.error("Failed to load checkpoint: %s" % e)
+    return _default_checkpoint()
+
+
+def save_checkpoint(path, data):
+    """Save checkpoint to JSON file atomically (write tmp then rename)."""
+    data['last_run'] = datetime.now().replace(microsecond=0).isoformat()
+    abs_path = os.path.abspath(path)
+    dir_name = os.path.dirname(abs_path)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp_path, abs_path)
+        logging.info("Checkpoint saved to %s" % path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+# ---------- HTTP client ----------
+
+class HttpClient:
+    """Reusable HTTP client wrapping requests.Session."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+        self.session.mount('http://', HTTPAdapter(max_retries=config.retry))
+        self.session.mount('https://', HTTPAdapter(max_retries=config.retry))
+        self.session.headers.update({
+            'accept': 'text/html,application/xhtml+xml,application/xml;'
+                      'q=0.9,image/avif,image/webp,image/apng,*/*;'
+                      'q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'cache-control': 'max-age=0',
+            'dnt': '1',
+            'priority': 'u=0, i',
+            'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", '
+                         '"Google Chrome";v="128"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'User-Agent': config.user_agent
+        })
+
+    def get(self, url):
+        """Send GET request and return response text, or None on failure."""
+        try:
+            response = self.session.get(url=url, timeout=self.config.timeout)
+            if response.status_code != requests.codes.ok:
+                logging.error(
+                    "Http request failed by url: %s, code: %d, body: %s" %
+                    (url, response.status_code, response.text))
+                return None
+            return response.text
+        except Exception:
+            logging.error("Http request exception by url: %s" % (url,))
+            return None
+
+
+# ---------- Reverse Geocoder ----------
+
+class ReverseGeocoder:
+    """Base class for reverse geocoding providers.
+
+    Subclasses must implement reverse_geocode() and update_address().
+    To switch to a different map API, create a new subclass.
+    """
+
+    def __init__(self, http_client, config):
+        self.http_client = http_client
+        self.config = config
+
+    def reverse_geocode(self, lat, lng):
+        """Reverse geocode coordinates. Returns provider result dict or None."""
+        raise NotImplementedError
+
+    def update_address(self, address_record, result):
+        """Update address record fields from geocoding result."""
+        raise NotImplementedError
+
+
+class TencentGeocoder(ReverseGeocoder):
+    """Tencent Maps reverse geocoding implementation."""
+
+    GEOCODER_PATH = "/ws/geocoder/v1/"
+    GEOCODER_URL = "https://apis.map.qq.com" + GEOCODER_PATH
+
+    @staticmethod
+    def _calculate_sig(path, params, sk):
+        """Calculate Tencent Maps SK signature (MD5)."""
+        sorted_params = sorted(params.items(), key=lambda x: x[0])
+        query_string = "&".join("%s=%s" % (k, v) for k, v in sorted_params)
+        raw_string = "%s?%s%s" % (path, query_string, sk)
+        return hashlib.md5(raw_string.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _get_safe(d, key, default=''):
+        """Safely get a string value from dict."""
+        val = d.get(key, default)
+        if isinstance(val, str):
+            return val
+        return default
+
+    def reverse_geocode(self, lat, lng):
+        """Call Tencent Maps reverse geocoding API. Returns parsed JSON or None."""
+        if not self.config.tencent_key:
+            logging.error("Tencent key is not set.")
+            return None
+
+        params = {
+            'key': self.config.tencent_key,
+            'location': "%s,%s" % (lat, lng),
+            'coord_type': '1',
+            'get_poi': '0',
+        }
+
+        if self.config.tencent_sk:
+            sig = self._calculate_sig(
+                self.GEOCODER_PATH, params, self.config.tencent_sk)
+            params['sig'] = sig
+
+        query_string = urllib.parse.urlencode(params)
+        url = "%s?%s" % (self.GEOCODER_URL, query_string)
+
+        raw = self.http_client.get(url)
+        # Rate limit: sleep regardless of outcome to avoid hammering the API.
+        time.sleep(self.config.geocoder_interval)
+        if raw is None:
+            return None
+
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logging.error("Tencent geocoder returned invalid JSON: %s" % e)
+            return None
+        if result is None or result.get('status') != 0:
+            logging.error("Tencent geocoder error: %s" % raw)
+            return None
+
+        logging.debug("Tencent raw response: %s" %
+                      json.dumps(result, ensure_ascii=False))
+        return result
+
+    def update_address(self, address_record, result):
+        """Update address record with Tencent Maps response data."""
+        r = result.get('result', {})
+        component = r.get('address_component', {})
+        formatted = r.get('formatted_addresses', {})
+
+        country = self._get_safe(component, 'nation')
+        province = self._get_safe(component, 'province')
+        city = self._get_safe(component, 'city')
+        district = self._get_safe(component, 'district')
+        street = self._get_safe(component, 'street')
+        street_number = self._get_safe(component, 'street_number')
+        neighbourhood = self._get_safe(component, 'neighbourhood')
+        display_name = self._get_safe(formatted, 'recommend')
+
+        # Handle municipalities (directly-administered cities).
+        # For 北京市/天津市/上海市/重庆市: state and city are both the municipality name,
+        # district (e.g. 海淀区) stays in county.
+        if province in ['北京市', '天津市', '上海市', '重庆市']:
+            city = province
+
+        # Derive name: use recommend, fall back to street.
+        name = display_name
+        if not name:
+            name = street
+
+        logging.info("update address from %s to %s" %
+                     (address_record.display_name, display_name))
+        logging.info("Tencent raw: country=%s, province=%s, city=%s, "
+                     "district=%s, street=%s, street_number=%s, "
+                     "neighbourhood=%s, recommend=%s, rough=%s" %
+                     (country, province, city, district, street, street_number,
+                      neighbourhood, display_name,
+                      self._get_safe(formatted, 'rough')))
+
+        address_record.country = country
+        address_record.state = province
+        address_record.city = city
+        address_record.county = district
+        address_record.display_name = display_name
+        address_record.house_number = street_number
+        address_record.updated_at = datetime.now().replace(microsecond=0)
+
+        if street:
+            address_record.road = street
+        if name:
+            address_record.name = name
+        if neighbourhood:
+            address_record.neighbourhood = neighbourhood
+
+
+# ---------- OSM helpers ----------
+
+OSM_RESOLVE_URL = ("https://nominatim.openstreetmap.org/reverse?"
+                   "lat=%.6f&lon=%.6f&format=jsonv2&addressdetails=1"
+                   "&extratags=1&namedetails=1&zoom=18")
 
 
 def get_address_str(address, addr_keys):
@@ -252,65 +374,62 @@ def get_address_name(address):
     return name
 
 
-def get_position(session, position_id):
-    '''get position id from table positions by position_ids.'''
+# ---------- Database helpers ----------
+
+def create_engine_from_config(config):
+    """Create SQLAlchemy engine from Config."""
+    if config.db_url:
+        return create_engine(config.db_url, echo=False)
+
+    def custom_json_dumps(d):
+        '''do not add backslash in json.'''
+        return d
+
+    conn_url = URL.create(
+        drivername="postgresql",
+        username=config.user,
+        password=config.password,
+        host=config.host,
+        port=config.port,
+        database=config.dbname
+    )
+    return create_engine(conn_url, json_serializer=custom_json_dumps,
+                         echo=False)
+
+
+def reflect_tables(engine):
+    """Reflect ORM classes from database tables."""
+    Base = automap_base()
+    Base.prepare(autoload_with=engine)
+    return (
+        Base.classes.drives,
+        Base.classes.charging_processes,
+        Base.classes.positions,
+        Base.classes.addresses,
+    )
+
+
+def get_position(session, position_id, Positions):
+    '''get position from table positions by position_id.'''
     position = session.query(Positions).filter(
         Positions.id == position_id).first()
-    # position_id is foreign key to table positions. position will never be None.
-    if position == None:
-        # fatal error, exit now.
-        logging.fatal("Position with ID %s is not found." % position_id)
-        assert (False)
+    if position is None:
+        raise RuntimeError("Position with ID %s is not found." % position_id)
     return position
 
 
-def http_request(url):
-    '''get response by calling map api.'''
-    http_session = requests.Session()
-    http_session.mount('http://', HTTPAdapter(max_retries=args.retry))
-    http_session.mount('https://', HTTPAdapter(max_retries=args.retry))
-    headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'cache-control': 'max-age=0',
-        'dnt': '1',
-        'priority': 'u=0, i',
-        'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-        'User-Agent': args.user_agent
-    }
-
-    try:
-        response = http_session.get(url=url, timeout=args.timeout, headers=headers)
-        if response.status_code != requests.codes.ok:
-            logging.error(
-                "Http request failed by url: %s, code: %d, body: %s" %
-                (url, response.status_code, response.text))
-            return None
-        raw = response.text
-        return raw
-    except:
-        logging.error("Http request exception by url: %s" % (url))
-        return None
+def get_address_in_db(session, Addresses, osm_id):
+    '''select address from db by osm_id.'''
+    return session.query(Addresses).filter(
+        Addresses.osm_id == osm_id).first()
 
 
-def get_address_in_db(session, osm_id):
-    '''select address from db, get address id which just added.'''
-    return session.query(Addresses).filter(Addresses.osm_id == osm_id).first()
-
-
-def add_osm_address(session, osm_address, raw):
+def add_osm_address(session, Addresses, osm_address, raw):
     '''add osm address to db.'''
-    exist_address = get_address_in_db(session, osm_address['osm_id'])
+    exist_address = get_address_in_db(session, Addresses,
+                                      osm_address['osm_id'])
     if exist_address is None:
-        logging.info("oms id = %d is not exist!" % osm_address['osm_id'])
-    if exist_address is None:
+        logging.info("osm id = %d is not exist!" % osm_address['osm_id'])
         address = Addresses(
             display_name=osm_address['display_name'],
             latitude=osm_address['lat'],
@@ -340,313 +459,379 @@ def add_osm_address(session, osm_address, raw):
                      (osm_address['osm_id'], osm_address['display_name']))
 
 
-def get_address(session, position):
+def resolve_osm_address(session, http_client, position, Addresses):
     '''
-    return address id and display_name by position id. 
-    Address will add into db if not exists.
+    Return (address_id, display_name) by resolving position via OSM.
+    Address will be added into db if not exists.
     '''
-    url = osm_resolve_url % (position.latitude, position.longitude)
-    raw = http_request(url)
+    url = OSM_RESOLVE_URL % (position.latitude, position.longitude)
+    raw = http_client.get(url)
+    # OSM Nominatim rate limit (policy: max 1 req/s)
+    time.sleep(http_client.config.osm_interval)
     if raw is None:
         return None, None
 
-    osm_address = json.loads(raw)
-    if osm_address == None:
+    try:
+        osm_address = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logging.error("OSM returned invalid JSON: %s" % e)
+        return None, None
+    if osm_address is None:
         return None, None
 
-    add_osm_address(session, osm_address, raw)
-    added_address = get_address_in_db(session, osm_address['osm_id'])
+    logging.debug("OSM raw response: %s" %
+                  json.dumps(osm_address, ensure_ascii=False))
+
+    add_osm_address(session, Addresses, osm_address, raw)
+    added_address = get_address_in_db(session, Addresses,
+                                      osm_address['osm_id'])
     return added_address.id, added_address.display_name
 
 
-def fix_address(session, batch_size, empty_count):
-    processed_count = 0
-    # get empty records in drives.
-    empty_drive_addresses = session\
-        .query(Drives)\
-        .filter(or_(Drives.start_address_id.is_(None), Drives.end_address_id.is_(None)))\
-        .filter(Drives.start_position_id.is_not(None))\
-        .filter(Drives.end_position_id.is_not(None))\
-        .limit(batch_size)\
-        .all()
+# ---------- Mode 0: Fix empty records ----------
 
-    # get empty records in charging_processes, all records are LE batch_size.
-    empty_charging_addresses = []
-    if len(empty_drive_addresses) < batch_size:
-        empty_charging_addresses = session\
-            .query(ChargingProcesses)\
-            .filter(ChargingProcesses.address_id.is_(None))\
-            .filter(ChargingProcesses.position_id.is_not(None))\
-            .limit(batch_size - len(empty_drive_addresses))\
-            .all()
-
-    # processing drives.
-    for empty_drive_address in empty_drive_addresses:
-        logging.info("processing drive address (%d left)" % (empty_count - processed_count))
-
-        # get positions.
-        start_position_id = empty_drive_address.start_position_id
-        end_position_id = empty_drive_address.end_position_id
-        start_position = get_position(session, start_position_id)
-        end_position = get_position(session, end_position_id)
-
-        # get addresses.
-        start_address_id, start_address = get_address(session, start_position)
-        end_address_id, end_address = get_address(session, end_position)
-        if start_address_id is None or end_address_id is None:
-            continue
-
-        # update address ids.
-        empty_drive_address.start_address_id = start_address_id
-        empty_drive_address.end_address_id = end_address_id
-        logging.info("Changing drives(id = %d) start address to %s" %
-                     (empty_drive_address.id, start_address))
-        logging.info("Changing drives(id = %d) end address to %s" %
-                     (empty_drive_address.id, end_address))
-        processed_count += 1
-
-    # processing charging.
-    for empty_charging_address in empty_charging_addresses:
-        logging.info("processing charging address (%d left)" % (empty_count - processed_count))
-
-        # get position.
-        position_id = empty_charging_address.position_id
-        position = get_position(session, position_id)
-
-        # get address.
-        address_id, address = get_address(session, position)
-        if address_id is None:
-            continue
-
-        # update address id.
-        empty_charging_address.address_id = address_id
-        logging.info("Changing charging(id = %d) to %s" %
-                     (empty_charging_address.id, address))
-        processed_count += 1
-
-    # records processed.
-    return processed_count
-
-
-def get_empty_record_count(session):
+def get_empty_record_count(session, Drives, ChargingProcesses):
     '''get all empty records count.'''
-    empty_count = session\
-        .query(Drives.id)\
-        .filter(or_(Drives.start_address_id.is_(None), Drives.end_address_id.is_(None)))\
-        .filter(Drives.start_position_id.is_not(None))\
-        .filter(Drives.end_position_id.is_not(None))\
+    empty_count = session \
+        .query(Drives.id) \
+        .filter(or_(Drives.start_address_id.is_(None),
+                     Drives.end_address_id.is_(None))) \
+        .filter(Drives.start_position_id.is_not(None)) \
+        .filter(Drives.end_position_id.is_not(None)) \
         .count()
 
-    empty_count += session\
-        .query(ChargingProcesses.id)\
-        .filter(ChargingProcesses.address_id.is_(None))\
-        .filter(ChargingProcesses.position_id.is_not(None))\
+    empty_count += session \
+        .query(ChargingProcesses.id) \
+        .filter(ChargingProcesses.address_id.is_(None)) \
+        .filter(ChargingProcesses.position_id.is_not(None)) \
         .count()
     return empty_count
 
 
-def fix_empty_records():
-    # for low memory devices.
+def fix_address_batch(session, http_client, config, tables):
+    """Fix one batch of empty addresses. Returns (count, max_drive_id, max_charging_id)."""
+    Drives, ChargingProcesses, Positions, Addresses = tables
+    batch_size = config.batch
+    processed_count = 0
+    max_drive_id = 0
+    max_charging_id = 0
+
+    empty_count = get_empty_record_count(session, Drives, ChargingProcesses)
+
+    # get empty records in drives.
+    empty_drives = session \
+        .query(Drives) \
+        .filter(or_(Drives.start_address_id.is_(None),
+                     Drives.end_address_id.is_(None))) \
+        .filter(Drives.start_position_id.is_not(None)) \
+        .filter(Drives.end_position_id.is_not(None)) \
+        .limit(batch_size) \
+        .all()
+
+    # get empty records in charging_processes, filling remaining capacity.
+    empty_chargings = []
+    if len(empty_drives) < batch_size:
+        empty_chargings = session \
+            .query(ChargingProcesses) \
+            .filter(ChargingProcesses.address_id.is_(None)) \
+            .filter(ChargingProcesses.position_id.is_not(None)) \
+            .limit(batch_size - len(empty_drives)) \
+            .all()
+
+    batch_total = len(empty_drives) + len(empty_chargings)
+
+    # processing drives.
+    for i, record in enumerate(empty_drives):
+        logging.info("processing drive address %d/%d (total remaining: %d, id=%d)" %
+                     (i + 1, batch_total, empty_count - processed_count, record.id))
+        start_position = get_position(session,
+                                      record.start_position_id, Positions)
+        end_position = get_position(session,
+                                    record.end_position_id, Positions)
+        start_addr_id, start_addr = resolve_osm_address(
+            session, http_client, start_position, Addresses)
+        end_addr_id, end_addr = resolve_osm_address(
+            session, http_client, end_position, Addresses)
+        if start_addr_id is None or end_addr_id is None:
+            continue
+        record.start_address_id = start_addr_id
+        record.end_address_id = end_addr_id
+        logging.info("Changing drives(id = %d) start address to %s" %
+                     (record.id, start_addr))
+        logging.info("Changing drives(id = %d) end address to %s" %
+                     (record.id, end_addr))
+        max_drive_id = max(max_drive_id, record.id)
+        processed_count += 1
+
+    # processing charging.
+    for i, record in enumerate(empty_chargings):
+        batch_pos = len(empty_drives) + i + 1
+        logging.info("processing charging address %d/%d (total remaining: %d, id=%d)" %
+                     (batch_pos, batch_total, empty_count - processed_count, record.id))
+        position = get_position(session, record.position_id, Positions)
+        addr_id, addr = resolve_osm_address(
+            session, http_client, position, Addresses)
+        if addr_id is None:
+            continue
+        record.address_id = addr_id
+        logging.info("Changing charging(id = %d) to %s" %
+                     (record.id, addr))
+        max_charging_id = max(max_charging_id, record.id)
+        processed_count += 1
+
+    return processed_count, max_drive_id, max_charging_id
+
+
+def fix_empty_records(engine, http_client, config, tables, checkpoint):
+    """Fix all empty address records in batches."""
     while True:
         with Session(engine) as session:
             logging.info("checking empty records...")
-            empty_count = get_empty_record_count(session)
-            if fix_address(session, args.batch, empty_count) == 0:
-                # all recoreds are fixed.
+            count, max_drive_id, max_charging_id = fix_address_batch(
+                session, http_client, config, tables)
+            if count == 0:
                 break
             else:
-                # commit at end of each batch.
                 logging.info("saving...")
                 session.commit()
+                if max_drive_id > 0:
+                    checkpoint['osm_fix']['last_drive_id'] = max_drive_id
+                if max_charging_id > 0:
+                    checkpoint['osm_fix']['last_charging_id'] = \
+                        max_charging_id
+                checkpoint['osm_fix']['fixed_count'] += count
+                save_checkpoint(config.checkpoint_path, checkpoint)
 
 
-def get_field(find, keys):
-    '''get field from a dict object'''
-    item = find
-    for key in keys:
-        if isinstance(key, str):
-            if key in item:
-                item = item[key]
-            else:
-                return ''
-        elif isinstance(key, int):
-            if len(item) > 0:
-                item = item[key]
-            else:
-                return ''
-    # we should have find address str here.
-    if not isinstance(item, str):
-        # some address will be empty list.
-        if len(item) == 0:
-            return ''
-        logging.fatal("key error when parse amap response.")
-        assert (False)
-    return item
+# ---------- Mode 1: Update addresses via reverse geocoder ----------
 
 
-def update_address_in_db(need_update_address, address_details):
-    # parse response.
-    country = get_field(address_details,
-                        ['regeocode', 'addressComponent', 'country'])
-    province = get_field(address_details,
-                         ['regeocode', 'addressComponent', 'province'])
-
-    municipality = province in ['北京市', '天津市', '上海市', '重庆市']
-    if municipality:
-        city = province + get_field(
-            address_details, ['regeocode', 'addressComponent', 'district'])
-    else:
-        city = get_field(address_details,
-                         ['regeocode', 'addressComponent', 'city'])
-
-    township = get_field(address_details,
-                         ['regeocode', 'addressComponent', 'township'])
-    display_name = get_field(address_details,
-                             ['regeocode', 'formatted_address'])
-    neighborhood = get_field(
-        address_details,
-        ['regeocode', 'addressComponent', 'neighborhood', 'name'])
-    street_number = get_field(
-        address_details,
-        ['regeocode', 'addressComponent', 'streetNumber', 'number'])
-    road = get_field(address_details, ['regeocode', 'roads', 0, 'name'])
-    name = get_field(address_details, ['regeocode', 'aois', 0, 'name'])
-    if len(name) == 0:
-        name = get_field(address_details, ['regeocode', 'pois', 0, 'name'])
-    if len(name) == 0:
-        name = get_field(address_details, ['regeocode', 'roads', 0, 'name'])
-
-    # update db record.
-    logging.info("update address from %s to %s" %
-                 (need_update_address.display_name, display_name))
-    need_update_address.state = province
-    need_update_address.county = township
-    need_update_address.city = city
-    need_update_address.house_number = street_number
-    need_update_address.display_name = display_name
-    need_update_address.country = country
-    need_update_address.updated_at = datetime.now().replace(microsecond=0)
-
-    # record last processed record id, skip records which id less than this.
-    # assume that address record will not updated.
-    # if language changed, teslamate will update all addressed, remember to
-    # restart me to re-process all records.
-    global last_update_id
-    last_update_id = need_update_address.id
-
-    # if some address is empty, do not update them.
-    if len(road) > 0:
-        need_update_address.road = road
-
-    if len(name) > 0:
-        need_update_address.name = name
-
-    if len(neighborhood) > 0:
-        need_update_address.neighbourhood = neighborhood
-
-
-def request_amap_api(url):
-    '''request from amap api and loads as dict'''
-    response = http_request(url)
-    if response is None:
-        return None
-    else:
-       # amap limits access frequency
-       time.sleep(0.3)
-
-    response_dict = json.loads(response)
-    if response_dict is None or response_dict['status'] != '1':
-        logging.error("request amap api error: %s" % response)
-        return None
-    return response_dict
-
-
-def get_update_record_count(session):
-    # record last updated id to save cpu time.
-    return session\
-        .query(Addresses)\
-        .filter(Addresses.updated_at >= args.since)\
-        .filter(Addresses.id > last_update_id)\
+def get_update_record_count(session, Addresses, config, last_address_id):
+    """Count addresses that need updating."""
+    return session \
+        .query(Addresses) \
+        .filter(Addresses.updated_at >= config.since) \
+        .filter(Addresses.id > last_address_id) \
         .count()
 
 
-def get_need_update_addresses(session, batch_size):
-    # record last update id to save cpu time.
-    return session\
-        .query(Addresses)\
-        .filter(Addresses.updated_at >= args.since)\
-        .filter(Addresses.id > last_update_id)\
-        .order_by(Addresses.id)\
-        .limit(batch_size)\
+def get_need_update_addresses(session, Addresses, config, last_address_id):
+    """Get batch of addresses to update."""
+    return session \
+        .query(Addresses) \
+        .filter(Addresses.updated_at >= config.since) \
+        .filter(Addresses.id > last_address_id) \
+        .order_by(Addresses.id) \
+        .limit(config.batch) \
         .all()
 
 
-def update_address(session, batch_size, need_update_count):
-    '''update address str by amap api.'''
+def update_address_batch(session, geocoder, config, Addresses, checkpoint):
+    """Update one batch of addresses via reverse geocoder.
+    Returns (updated_count, found_count)."""
     processed_count = 0
-    if len(args.key) == 0:
-        logging.error("Amap key is not set.")
-        return 0
+    last_address_id = checkpoint['map_update']['last_address_id']
 
-    need_update_addresses = get_need_update_addresses(session, batch_size)
+    total_remaining = get_update_record_count(
+        session, Addresses, config, last_address_id)
+    need_update_addresses = get_need_update_addresses(
+        session, Addresses, config, last_address_id)
 
-    for need_update_address in need_update_addresses:
-        logging.info("processing update address (%d left)" %
-                     (need_update_count - processed_count))
-        gps_lat = need_update_address.latitude
-        gps_lon = need_update_address.longitude
+    for i, address_record in enumerate(need_update_addresses):
+        logging.info("processing update address %d/%d (total remaining: %d, id=%d)" %
+                     (i + 1, len(need_update_addresses), total_remaining - i, address_record.id))
 
-        # transform coordinate
-        url = amap_coordinate_transformation_url % (args.key, gps_lon, gps_lat)
-        transformed_coordinate = request_amap_api(url)
-        if transformed_coordinate is None:
+        result = geocoder.reverse_geocode(
+            address_record.latitude,
+            address_record.longitude
+        )
+        # Always advance checkpoint, even on failure, to prevent permanently
+        # skipping records when a later record in the same batch succeeds.
+        checkpoint['map_update']['last_address_id'] = address_record.id
+        if result is None:
+            logging.warning("Geocoding failed for address id=%d, skipping." %
+                            address_record.id)
             continue
 
-        locations = transformed_coordinate['locations']
-        amap_lon = round(float(locations.split(',')[0]), 6)
-        amap_lat = round(float(locations.split(',')[1]), 6)
-
-        # get address details
-        url = amap_resolve_url % (args.key, amap_lon, amap_lat)
-        address_details = request_amap_api(url)
-        if address_details is None:
-            continue
-
-        # update db
-        update_address_in_db(need_update_address, address_details)
-
+        geocoder.update_address(address_record, result)
         processed_count += 1
 
-    return processed_count
+    return processed_count, len(need_update_addresses)
 
 
-def update_address_by_amap():
+def update_addresses(engine, geocoder, config, Addresses, checkpoint):
+    """Update all addresses via reverse geocoder in batches."""
     while True:
         with Session(engine) as session:
-            logging.info("updating address by amap...")
-            need_update_count = get_update_record_count(session)
-            if update_address(session, args.batch, need_update_count) == 0:
-                # all recoreds are updated.
+            logging.info("updating addresses...")
+            count, found = update_address_batch(
+                session, geocoder, config, Addresses, checkpoint)
+            if found == 0:
                 break
-            else:
-                # commit at end of each batch.
+            if count > 0:
                 logging.info("saving...")
                 session.commit()
+                checkpoint['map_update']['updated_count'] += count
+            # Always save checkpoint so skipped (failed) records are not retried
+            # indefinitely within the same run.
+            save_checkpoint(config.checkpoint_path, checkpoint)
+
+
+# ---------- Argument parsing ----------
+
+def parse_args():
+    """Parse command line arguments and return a Config object."""
+    parser = argparse.ArgumentParser(description='Usage of address fixer.')
+    parser.add_argument(
+        "--db-url", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_URL",
+        help="full database URL, overrides individual db params(DB_URL).")
+    parser.add_argument(
+        "-u", "--user", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_USER",
+        help="db user name(DB_USER).")
+    parser.add_argument(
+        "-p", "--password", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_PASSWD",
+        help="db password(DB_PASSWD).")
+    parser.add_argument(
+        "-H", "--host", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_HOST",
+        help="db host name or ip address(DB_HOST).")
+    parser.add_argument(
+        "-P", "--port", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_PORT",
+        help="db port(DB_PORT).")
+    parser.add_argument(
+        "-d", "--dbname", required=False, type=str, default='',
+        action=EnvDefault, envvar="DB_NAME",
+        help="db name(DB_NAME).")
+    parser.add_argument(
+        "-b", "--batch", required=False, type=int, default=10,
+        action=EnvDefault, envvar="BATCH",
+        help="batch size for one loop(BATCH).")
+    parser.add_argument(
+        "-t", "--timeout", required=False, type=int, default=5,
+        action=EnvDefault, envvar="HTTP_TIMEOUT",
+        help="http request timeout(s)(HTTP_TIMEOUT).")
+    parser.add_argument(
+        "-r", "--retry", required=False, type=int, default=5,
+        action=EnvDefault, envvar="HTTP_RETRY",
+        help="http request max retries(HTTP_RETRY).")
+    parser.add_argument(
+        "-i", "--interval", required=False, type=int, default=0,
+        action=EnvDefault, envvar="INTERVAL",
+        help="if value not 0, run in infinity mode, "
+             "fix record in every interval seconds(INTERVAL).")
+    parser.add_argument(
+        "-m", "--mode", required=False, type=int, default=0,
+        action=EnvDefault, envvar="MODE",
+        help="run mode: 0 -> fix empty record; "
+             "1 -> update address by map api; 2 -> do both(MODE).")
+    parser.add_argument(
+        "-k", "--key", required=False, type=str, default='',
+        action=EnvDefault, envvar="TENCENT_KEY",
+        help="API key for calling tencent maps(TENCENT_KEY).")
+    parser.add_argument(
+        "--sk", required=False, type=str, default='',
+        action=EnvDefault, envvar="TENCENT_SK",
+        help="SK for tencent maps signature(TENCENT_SK).")
+    parser.add_argument(
+        "-s", "--since", required=False,
+        type=lambda d: datetime.strptime(d, '%Y-%m-%d'),
+        default=datetime.min,
+        action=EnvDefault, envvar="SINCE",
+        help="Update from specified date(YYYY-mm-dd).")
+    parser.add_argument(
+        "-ua", "--user_agent", required=False, type=str,
+        default='teslamate/#v1.29.2',
+        action=EnvDefault, envvar="USER_AGENT",
+        help="Custom User-Agent for HTTP requests(USER_AGENT).")
+    parser.add_argument(
+        "--osm-interval", required=False, type=float, default=1.0,
+        action=EnvDefault, envvar="OSM_INTERVAL",
+        help="seconds to sleep between OSM requests(OSM_INTERVAL).")
+    parser.add_argument(
+        "--geocoder-interval", required=False, type=float, default=0.3,
+        action=EnvDefault, envvar="GEOCODER_INTERVAL",
+        help="seconds to sleep between geocoder API requests(GEOCODER_INTERVAL).")
+    parser.add_argument(
+        "-c", "--checkpoint", required=False, type=str,
+        default='checkpoint.json',
+        action=EnvDefault, envvar="CHECKPOINT_FILE",
+        help="checkpoint file path(CHECKPOINT_FILE).")
+    parser.add_argument(
+        "--reset-checkpoint", required=False,
+        action='store_true', default=False,
+        help="reset checkpoint and start fresh.")
+
+    args = parser.parse_args()
+
+    if not args.db_url and not all([args.user, args.password, args.host, args.port, args.dbname]):
+        parser.error("Either --db-url (DB_URL) or all of -u/-p/-H/-P/-d must be provided.")
+
+    since = args.since
+    if isinstance(since, str):
+        since = datetime.strptime(since, '%Y-%m-%d')
+
+    return Config(
+        user=args.user,
+        password=args.password,
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        db_url=args.db_url,
+        batch=int(args.batch),
+        timeout=int(args.timeout),
+        retry=int(args.retry),
+        interval=int(args.interval),
+        mode=int(args.mode),
+        tencent_key=args.key,
+        tencent_sk=args.sk,
+        since=since,
+        user_agent=args.user_agent,
+        checkpoint_path=args.checkpoint,
+        reset_checkpoint=args.reset_checkpoint,
+        osm_interval=float(args.osm_interval),
+        geocoder_interval=float(args.geocoder_interval),
+    )
+
+
+# ---------- Main ----------
+
+def run_once(engine, http_client, config, tables, checkpoint, geocoder):
+    """Run one cycle of the configured mode."""
+    Drives, ChargingProcesses, Positions, Addresses = tables
+
+    if config.mode == 0 or config.mode == 2:
+        fix_empty_records(engine, http_client, config, tables, checkpoint)
+    if config.mode == 1 or config.mode == 2:
+        update_addresses(engine, geocoder, config, Addresses, checkpoint)
+
+    if config.mode < 0 or config.mode > 2:
+        logging.info("nothing to do, bye.")
 
 
 def main():
-    if args.mode == 0 or args.mode == 2:
-        fix_empty_records()
-    if args.mode == 1 or args.mode == 2:
-        update_address_by_amap()
+    config = parse_args()
+    engine = create_engine_from_config(config)
+    http_client = HttpClient(config)
+    tables = reflect_tables(engine)
+    geocoder = TencentGeocoder(http_client, config)
 
-    # wrong mode, do nothing and exit.
-    if args.mode < 0 or args.mode > 2:
-        logging.info("nothing to do, bye.")
-    # if interval is set, run in infinity mode.
-    elif args.interval != 0:
-        loop_timer = Timer(args.interval, main)
-        loop_timer.start()
+    if config.reset_checkpoint:
+        logging.info("Resetting checkpoint.")
+        checkpoint = _default_checkpoint()
+    else:
+        checkpoint = load_checkpoint(config.checkpoint_path)
+
+    if config.interval == 0:
+        run_once(engine, http_client, config, tables, checkpoint, geocoder)
+    else:
+        while True:
+            run_once(engine, http_client, config, tables, checkpoint, geocoder)
+            logging.info("sleeping for %d seconds..." % config.interval)
+            time.sleep(config.interval)
 
 
 if __name__ == '__main__':

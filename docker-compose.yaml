@@ -14,5 +14,8 @@ services:
     - HTTP_RETRY=5
     - INTERVAL=5
     - MODE=0
-    - KEY=
+    - TENCENT_KEY=
+    - TENCENT_SK=
     - USER_AGENT=
+    - OSM_INTERVAL=1.0
+    - GEOCODER_INTERVAL=0.3
