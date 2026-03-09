@@ -274,7 +274,11 @@ class TencentGeocoder(ReverseGeocoder):
         if raw is None:
             return None
 
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logging.error("Tencent geocoder returned invalid JSON: %s" % e)
+            return None
         if result is None or result.get('status') != 0:
             logging.error("Tencent geocoder error: %s" % raw)
             return None
@@ -467,7 +471,11 @@ def resolve_osm_address(session, http_client, position, Addresses):
     if raw is None:
         return None, None
 
-    osm_address = json.loads(raw)
+    try:
+        osm_address = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logging.error("OSM returned invalid JSON: %s" % e)
+        return None, None
     if osm_address is None:
         return None, None
 
@@ -621,14 +629,14 @@ def update_address_batch(session, geocoder, config, Addresses, checkpoint):
     processed_count = 0
     last_address_id = checkpoint['map_update']['last_address_id']
 
-    need_update_count = get_update_record_count(
+    total_remaining = get_update_record_count(
         session, Addresses, config, last_address_id)
     need_update_addresses = get_need_update_addresses(
         session, Addresses, config, last_address_id)
 
-    for address_record in need_update_addresses:
-        logging.info("processing update address (%d left)" %
-                     (need_update_count - processed_count))
+    for i, address_record in enumerate(need_update_addresses):
+        logging.info("processing update address %d/%d (total remaining: %d, id=%d)" %
+                     (i + 1, len(need_update_addresses), total_remaining - i, address_record.id))
 
         result = geocoder.reverse_geocode(
             address_record.latitude,
@@ -676,23 +684,23 @@ def parse_args():
         action=EnvDefault, envvar="DB_URL",
         help="full database URL, overrides individual db params(DB_URL).")
     parser.add_argument(
-        "-u", "--user", required=True, type=str,
+        "-u", "--user", required=False, type=str, default='',
         action=EnvDefault, envvar="DB_USER",
         help="db user name(DB_USER).")
     parser.add_argument(
-        "-p", "--password", required=True, type=str,
+        "-p", "--password", required=False, type=str, default='',
         action=EnvDefault, envvar="DB_PASSWD",
         help="db password(DB_PASSWD).")
     parser.add_argument(
-        "-H", "--host", required=True, type=str,
+        "-H", "--host", required=False, type=str, default='',
         action=EnvDefault, envvar="DB_HOST",
         help="db host name or ip address(DB_HOST).")
     parser.add_argument(
-        "-P", "--port", required=True, type=str,
+        "-P", "--port", required=False, type=str, default='',
         action=EnvDefault, envvar="DB_PORT",
         help="db port(DB_PORT).")
     parser.add_argument(
-        "-d", "--dbname", required=True, type=str,
+        "-d", "--dbname", required=False, type=str, default='',
         action=EnvDefault, envvar="DB_NAME",
         help="db name(DB_NAME).")
     parser.add_argument(
@@ -755,6 +763,9 @@ def parse_args():
         help="reset checkpoint and start fresh.")
 
     args = parser.parse_args()
+
+    if not args.db_url and not all([args.user, args.password, args.host, args.port, args.dbname]):
+        parser.error("Either --db-url (DB_URL) or all of -u/-p/-H/-P/-d must be provided.")
 
     since = args.since
     if isinstance(since, str):
