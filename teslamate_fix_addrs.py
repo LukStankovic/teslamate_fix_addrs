@@ -538,10 +538,12 @@ def fix_address_batch(session, http_client, config, tables):
             .limit(batch_size - len(empty_drives)) \
             .all()
 
+    batch_total = len(empty_drives) + len(empty_chargings)
+
     # processing drives.
-    for record in empty_drives:
-        logging.info("processing drive address (%d left)" %
-                     (empty_count - processed_count))
+    for i, record in enumerate(empty_drives):
+        logging.info("processing drive address %d/%d (total remaining: %d, id=%d)" %
+                     (i + 1, batch_total, empty_count - processed_count, record.id))
         start_position = get_position(session,
                                       record.start_position_id, Positions)
         end_position = get_position(session,
@@ -562,9 +564,10 @@ def fix_address_batch(session, http_client, config, tables):
         processed_count += 1
 
     # processing charging.
-    for record in empty_chargings:
-        logging.info("processing charging address (%d left)" %
-                     (empty_count - processed_count))
+    for i, record in enumerate(empty_chargings):
+        batch_pos = len(empty_drives) + i + 1
+        logging.info("processing charging address %d/%d (total remaining: %d, id=%d)" %
+                     (batch_pos, batch_total, empty_count - processed_count, record.id))
         position = get_position(session, record.position_id, Positions)
         addr_id, addr = resolve_osm_address(
             session, http_client, position, Addresses)
