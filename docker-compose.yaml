@@ -17,3 +17,5 @@ services:
     - TENCENT_KEY=
     - TENCENT_SK=
     - USER_AGENT=
+    - OSM_INTERVAL=1.0
+    - GEOCODER_INTERVAL=0.3

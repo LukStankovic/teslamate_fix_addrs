@@ -143,6 +143,8 @@ If you installed teslamate by docker, you can choose alternative solutions.
        - TENCENT_KEY=your_tencent_key
        - TENCENT_SK=your_tencent_sk
        - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
+       - OSM_INTERVAL=1.0
+       - GEOCODER_INTERVAL=0.3
    ```
 
 
@@ -173,6 +175,8 @@ teslamate_fix_addrs:
     - TENCENT_KEY=your_tencent_key
     - TENCENT_SK=your_tencent_sk
     - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
+    - OSM_INTERVAL=1.0
+    - GEOCODER_INTERVAL=0.3
 ```
 
 
@@ -180,26 +184,28 @@ teslamate_fix_addrs:
 **Run python script**
 
 ```
-usage: teslamate_fix_addrs.py [-h] -u USER -p PASSWORD -H HOST -P PORT -d DBNAME [-b BATCH] [-t TIMEOUT] [-r RETRY] [-i INTERVAL] [-m MODE] [-k KEY] [--sk SK] [-s SINCE] [-ua USER_AGENT]
+usage: teslamate_fix_addrs.py [-h] -u USER -p PASSWORD -H HOST -P PORT -d DBNAME [-b BATCH] [-t TIMEOUT] [-r RETRY] [-i INTERVAL] [-m MODE] [-k KEY] [--sk SK] [-s SINCE] [-ua USER_AGENT] [--osm-interval OSM_INTERVAL] [--geocoder-interval GEOCODER_INTERVAL]
 
 Usage of address fixer.
 
 options:
-  -h, --help                               show this help message and exit
-  -u USER, --user USER                     db user name(DB_USER).
-  -p PASSWORD, --password PASSWORD         db password(DB_PASSWD).
-  -H HOST, --host HOST                     db host name or ip address(DB_HOST).
-  -P PORT, --port PORT                     db port(DB_PORT).
-  -d DBNAME, --dbname DBNAME               db name(DB_NAME).
-  -b BATCH, --batch BATCH                  batch size for one loop(BATCH).
-  -t TIMEOUT, --timeout TIMEOUT            http request timeout(s)(HTTP_TIMEOUT).
-  -r RETRY, --retry RETRY                  http request max retries(HTTP_RETRY).
-  -i INTERVAL, --interval INTERVAL         if value not 0, run in infinity mode, fix record in every interval seconds(INTERVAL).
-  -m MODE, --mode MODE                     run mode: 0 -> fix empty record; 1 -> update address by tencent; 2 -> do both(MODE).
-  -k KEY, --key KEY                        API key for calling tencent maps(TENCENT_KEY).
-  --sk SK                                  SK for tencent maps signature(TENCENT_SK).
-  -s SINCE, --since SINCE                  Update from specified date(YYYY-mm-dd).
-  -ua USER_AGENT, --user_agent USER_AGENT  Custom User-Agent for HTTP requests(USER_AGENT).
+  -h, --help                                         show this help message and exit
+  -u USER, --user USER                               db user name(DB_USER).
+  -p PASSWORD, --password PASSWORD                   db password(DB_PASSWD).
+  -H HOST, --host HOST                               db host name or ip address(DB_HOST).
+  -P PORT, --port PORT                               db port(DB_PORT).
+  -d DBNAME, --dbname DBNAME                         db name(DB_NAME).
+  -b BATCH, --batch BATCH                            batch size for one loop(BATCH).
+  -t TIMEOUT, --timeout TIMEOUT                      http request timeout(s)(HTTP_TIMEOUT).
+  -r RETRY, --retry RETRY                            http request max retries(HTTP_RETRY).
+  -i INTERVAL, --interval INTERVAL                   if value not 0, run in infinity mode, fix record in every interval seconds(INTERVAL).
+  -m MODE, --mode MODE                               run mode: 0 -> fix empty record; 1 -> update address by map api; 2 -> do both(MODE).
+  -k KEY, --key KEY                                  API key for calling tencent maps(TENCENT_KEY).
+  --sk SK                                            SK for tencent maps signature(TENCENT_SK).
+  -s SINCE, --since SINCE                            Update from specified date(YYYY-mm-dd).
+  -ua USER_AGENT, --user_agent USER_AGENT            Custom User-Agent for HTTP requests(USER_AGENT).
+  --osm-interval OSM_INTERVAL                        seconds to sleep between OSM requests, default 1.0(OSM_INTERVAL).
+  --geocoder-interval GEOCODER_INTERVAL              seconds to sleep between geocoder API requests, default 0.3(GEOCODER_INTERVAL).
 ```
 
 
@@ -258,6 +264,8 @@ Worry about damaging existing data? You can have a try in sandbox.
        - TENCENT_KEY=your_tencent_key
        - TENCENT_SK=your_tencent_sk
        - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
+       - OSM_INTERVAL=1.0
+       - GEOCODER_INTERVAL=0.3
 
    volumes:
      teslamate-grafana-data:
