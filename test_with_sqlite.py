@@ -3,8 +3,8 @@
 Test script for teslamate_fix_addrs.py using SQLite.
 
 Creates a SQLite database with TeslaMate-compatible tables, inserts test data,
-and runs the program in Mode 0 (OSM fix) and Mode 1 (map API update)
-to verify functionality.
+and runs the program in Mode 0 (OSM fix), Mode 1 (map API update) and
+Mode 3 (map API fix without OSM) to verify functionality.
 """
 
 import sqlite3
@@ -276,6 +276,67 @@ def verify_mode1():
     return all_ok
 
 
+def reset_addresses():
+    """Drop all addresses and unlink them, as if OSM had never run."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE drives SET start_address_id = NULL, '
+              'end_address_id = NULL')
+    c.execute('UPDATE charging_processes SET address_id = NULL')
+    c.execute('DELETE FROM addresses')
+    conn.commit()
+    conn.close()
+
+
+def verify_mode3():
+    """Verify Mode 3 results: addresses created by the map API alone."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    print("\n" + "=" * 60)
+    print("Verifying Mode 3 (map API fix, no OSM) results")
+    print("=" * 60)
+
+    ok = True
+
+    c.execute('SELECT COUNT(*) FROM addresses')
+    address_count = c.fetchone()[0]
+    print("  Addresses created: %d (expected %d)" %
+          (address_count, len(POSITIONS)))
+    if address_count != len(POSITIONS):
+        print("  FAILED: expected one address per distinct position")
+        ok = False
+
+    c.execute('SELECT DISTINCT osm_type FROM addresses')
+    osm_types = [row[0] for row in c.fetchall()]
+    print("  osm_type values: %s" % osm_types)
+    if osm_types != ['tencent']:
+        print("  FAILED: addresses should be tagged with the map source")
+        ok = False
+
+    c.execute('SELECT COUNT(DISTINCT osm_id) FROM addresses')
+    if c.fetchone()[0] != address_count:
+        print("  FAILED: osm_id is not unique per address")
+        ok = False
+
+    c.execute('SELECT display_name, city, road FROM addresses')
+    for display_name, city, road in c.fetchall():
+        print("    %s | city=%s | road=%s" % (display_name, city, road))
+        if not display_name:
+            print("  FAILED: display_name is empty")
+            ok = False
+
+    conn.close()
+
+    if not check_all_drives_fixed() or not check_all_chargings_fixed():
+        print("  FAILED: some records are still unlinked")
+        ok = False
+
+    if ok:
+        print("  PASSED")
+    return ok
+
+
 def verify_checkpoint():
     """Verify checkpoint file was created and contains expected data."""
     print("\n" + "=" * 60)
@@ -351,8 +412,17 @@ def main():
     print("\nStep 7: Verifying Mode 1 results...")
     mode1_ok = verify_mode1()
 
-    # Step 8: Verify checkpoint
-    print("\nStep 8: Verifying checkpoint...")
+    # Step 8: Run Mode 3 (map API fix without OSM)
+    print("\nStep 8: Running Mode 3 (map API address fix, no OSM)...")
+    reset_addresses()
+    run_program(3, ['--reset-checkpoint'])
+
+    # Step 9: Verify Mode 3
+    print("\nStep 9: Verifying Mode 3 results...")
+    mode3_ok = verify_mode3()
+
+    # Step 10: Verify checkpoint
+    print("\nStep 10: Verifying checkpoint...")
     checkpoint_ok = verify_checkpoint()
 
     # Summary
@@ -362,6 +432,7 @@ def main():
     results = [
         ("Mode 0 (OSM fix)", mode0_ok),
         ("Mode 1 (map API update)", mode1_ok),
+        ("Mode 3 (map API fix)", mode3_ok),
         ("Checkpoint", checkpoint_ok),
     ]
     for name, ok in results:

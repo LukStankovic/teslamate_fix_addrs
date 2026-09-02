@@ -210,7 +210,11 @@ class ReverseGeocoder:
 
     Subclasses must implement reverse_geocode() and update_address().
     To switch to a different map API, create a new subclass.
+    Subclasses must also set source_name, used as osm_type for addresses
+    created by this provider.
     """
+
+    source_name = None
 
     def __init__(self, http_client, config):
         self.http_client = http_client
@@ -227,6 +231,8 @@ class ReverseGeocoder:
 
 class TencentGeocoder(ReverseGeocoder):
     """Tencent Maps reverse geocoding implementation."""
+
+    source_name = 'tencent'
 
     GEOCODER_PATH = "/ws/geocoder/v1/"
     GEOCODER_URL = "https://apis.map.qq.com" + GEOCODER_PATH
@@ -488,6 +494,62 @@ def resolve_osm_address(session, http_client, position, Addresses):
     return added_address.id, added_address.display_name
 
 
+# ---------- Geocoder-created addresses ----------
+
+COORD_KEY_DECIMALS = 4
+COORD_KEY_SCALE = 10 ** COORD_KEY_DECIMALS
+COORD_KEY_LON_DIGITS = 10 ** 7
+
+
+def coord_key(latitude, longitude):
+    '''Stable synthetic osm_id for a coordinate, so the same place resolves
+    to a single address row instead of one row per drive.'''
+    lat_units = round((float(latitude) + 90) * COORD_KEY_SCALE)
+    lon_units = round((float(longitude) + 180) * COORD_KEY_SCALE)
+    return lat_units * COORD_KEY_LON_DIGITS + lon_units
+
+
+def get_address_by_source(session, Addresses, osm_id, osm_type):
+    '''select address from db by the (osm_id, osm_type) unique key.'''
+    return session.query(Addresses).filter(
+        Addresses.osm_id == osm_id,
+        Addresses.osm_type == osm_type).first()
+
+
+def resolve_geocoder_address(session, geocoder, position, Addresses):
+    '''
+    Return (address_id, display_name) by resolving position via the geocoder,
+    without contacting OSM. Address will be added into db if not exists.
+    '''
+    osm_id = coord_key(position.latitude, position.longitude)
+    osm_type = geocoder.source_name
+
+    exist_address = get_address_by_source(session, Addresses, osm_id, osm_type)
+    if exist_address is not None:
+        logging.info("address is already exist: %d, %s." %
+                     (osm_id, exist_address.display_name))
+        return exist_address.id, exist_address.display_name
+
+    result = geocoder.reverse_geocode(position.latitude, position.longitude)
+    if result is None:
+        return None, None
+
+    now = datetime.now().replace(microsecond=0)
+    address = Addresses(
+        latitude=position.latitude,
+        longitude=position.longitude,
+        raw=json.dumps(result, ensure_ascii=False),
+        inserted_at=now,
+        updated_at=now,
+        osm_id=osm_id,
+        osm_type=osm_type)
+    geocoder.update_address(address, result)
+    session.add(address)
+    session.flush()
+    logging.info("address added: %s." % address.display_name)
+    return address.id, address.display_name
+
+
 # ---------- Mode 0: Fix empty records ----------
 
 def get_empty_record_count(session, Drives, ChargingProcesses):
@@ -508,7 +570,7 @@ def get_empty_record_count(session, Drives, ChargingProcesses):
     return empty_count
 
 
-def fix_address_batch(session, http_client, config, tables):
+def fix_address_batch(session, resolve, config, tables):
     """Fix one batch of empty addresses. Returns (count, max_drive_id, max_charging_id)."""
     Drives, ChargingProcesses, Positions, Addresses = tables
     batch_size = config.batch
@@ -548,10 +610,10 @@ def fix_address_batch(session, http_client, config, tables):
                                       record.start_position_id, Positions)
         end_position = get_position(session,
                                     record.end_position_id, Positions)
-        start_addr_id, start_addr = resolve_osm_address(
-            session, http_client, start_position, Addresses)
-        end_addr_id, end_addr = resolve_osm_address(
-            session, http_client, end_position, Addresses)
+        start_addr_id, start_addr = resolve(
+            session, start_position, Addresses)
+        end_addr_id, end_addr = resolve(
+            session, end_position, Addresses)
         if start_addr_id is None or end_addr_id is None:
             continue
         record.start_address_id = start_addr_id
@@ -569,8 +631,7 @@ def fix_address_batch(session, http_client, config, tables):
         logging.info("processing charging address %d/%d (total remaining: %d, id=%d)" %
                      (batch_pos, batch_total, empty_count - processed_count, record.id))
         position = get_position(session, record.position_id, Positions)
-        addr_id, addr = resolve_osm_address(
-            session, http_client, position, Addresses)
+        addr_id, addr = resolve(session, position, Addresses)
         if addr_id is None:
             continue
         record.address_id = addr_id
@@ -582,13 +643,13 @@ def fix_address_batch(session, http_client, config, tables):
     return processed_count, max_drive_id, max_charging_id
 
 
-def fix_empty_records(engine, http_client, config, tables, checkpoint):
+def fix_empty_records(engine, resolve, config, tables, checkpoint):
     """Fix all empty address records in batches."""
     while True:
         with Session(engine) as session:
             logging.info("checking empty records...")
             count, max_drive_id, max_charging_id = fix_address_batch(
-                session, http_client, config, tables)
+                session, resolve, config, tables)
             if count == 0:
                 break
             else:
@@ -726,8 +787,9 @@ def parse_args():
     parser.add_argument(
         "-m", "--mode", required=False, type=int, default=0,
         action=EnvDefault, envvar="MODE",
-        help="run mode: 0 -> fix empty record; "
-             "1 -> update address by map api; 2 -> do both(MODE).")
+        help="run mode: 0 -> fix empty record via OSM; "
+             "1 -> update address by map api; 2 -> do both; "
+             "3 -> fix empty record via map api, no OSM(MODE).")
     parser.add_argument(
         "-k", "--key", required=False, type=str, default='',
         action=EnvDefault, envvar="TENCENT_KEY",
@@ -804,11 +866,22 @@ def run_once(engine, http_client, config, tables, checkpoint, geocoder):
     Drives, ChargingProcesses, Positions, Addresses = tables
 
     if config.mode == 0 or config.mode == 2:
-        fix_empty_records(engine, http_client, config, tables, checkpoint)
+        def resolve_via_osm(session, position, Addresses):
+            return resolve_osm_address(
+                session, http_client, position, Addresses)
+
+        fix_empty_records(engine, resolve_via_osm, config, tables, checkpoint)
     if config.mode == 1 or config.mode == 2:
         update_addresses(engine, geocoder, config, Addresses, checkpoint)
+    if config.mode == 3:
+        def resolve_via_geocoder(session, position, Addresses):
+            return resolve_geocoder_address(
+                session, geocoder, position, Addresses)
 
-    if config.mode < 0 or config.mode > 2:
+        fix_empty_records(
+            engine, resolve_via_geocoder, config, tables, checkpoint)
+
+    if config.mode < 0 or config.mode > 3:
         logging.info("nothing to do, bye.")
 
 
