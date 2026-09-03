@@ -10,6 +10,7 @@ import hashlib
 import urllib.parse
 from datetime import datetime
 import logging
+import re
 import argparse
 import os
 import signal
@@ -104,6 +105,7 @@ class Config:
     reset_checkpoint: bool = False
     osm_interval: float = 1.0
     geocoder_interval: float = 0.3
+    short_names: bool = False
 
 
 # ---------- Checkpoint persistence ----------
@@ -229,6 +231,20 @@ class ReverseGeocoder:
         raise NotImplementedError
 
 
+TRAILING_PARENTHETICAL = re.compile(r'\s*[（(][^（）()]*[）)]\s*$')
+
+
+def shorten_name(name, district):
+    '''Drop the leading district and the trailing parenthetical, so names line
+    up with the shorter form Amap returns. Falls back to the original name if
+    nothing would be left.'''
+    shortened = name
+    if district and shortened.startswith(district):
+        shortened = shortened[len(district):]
+    shortened = TRAILING_PARENTHETICAL.sub('', shortened).strip()
+    return shortened or name
+
+
 class TencentGeocoder(ReverseGeocoder):
     """Tencent Maps reverse geocoding implementation."""
 
@@ -307,6 +323,9 @@ class TencentGeocoder(ReverseGeocoder):
         street_number = self._get_safe(component, 'street_number')
         neighbourhood = self._get_safe(component, 'neighbourhood')
         display_name = self._get_safe(formatted, 'recommend')
+
+        if self.config.short_names and display_name:
+            display_name = shorten_name(display_name, district)
 
         # Handle municipalities (directly-administered cities).
         # For 北京市/天津市/上海市/重庆市: state and city are both the municipality name,
@@ -818,6 +837,11 @@ def parse_args():
         action=EnvDefault, envvar="GEOCODER_INTERVAL",
         help="seconds to sleep between geocoder API requests(GEOCODER_INTERVAL).")
     parser.add_argument(
+        "--short-names", required=False, type=int, default=0,
+        action=EnvDefault, envvar="SHORT_NAMES",
+        help="set to 1 to drop the leading district and the trailing "
+             "parenthetical from resolved names(SHORT_NAMES).")
+    parser.add_argument(
         "-c", "--checkpoint", required=False, type=str,
         default='checkpoint.json',
         action=EnvDefault, envvar="CHECKPOINT_FILE",
@@ -856,6 +880,7 @@ def parse_args():
         reset_checkpoint=args.reset_checkpoint,
         osm_interval=float(args.osm_interval),
         geocoder_interval=float(args.geocoder_interval),
+        short_names=bool(int(args.short_names)),
     )
 
 
